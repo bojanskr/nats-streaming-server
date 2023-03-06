@@ -164,6 +164,11 @@ type srvGateway struct {
 	// These are used for routing of mapped replies.
 	sIDHash        []byte   // Server ID hash (6 bytes)
 	routesIDByHash sync.Map // Route's server ID is hashed (6 bytes) and stored in this map.
+
+	// If a server has its own configuration in the "Gateways" remotes configuration
+	// we will keep track of the URLs that are defined in the config so they can
+	// be reported in monitoring.
+	ownCfgURLs []string
 }
 
 // Subject interest tally. Also indicates if the key in the map is a
@@ -371,6 +376,7 @@ func (s *Server) newGateway(opts *Options) error {
 	for _, rgo := range opts.Gateway.Gateways {
 		// Ignore if there is a remote gateway with our name.
 		if rgo.Name == gateway.name {
+			gateway.ownCfgURLs = getURLsAsString(rgo.URLs)
 			continue
 		}
 		cfg := &gatewayCfg{
@@ -781,6 +787,8 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 		c.Noticef("Processing inbound gateway connection")
 		// Check if TLS is required for inbound GW connections.
 		tlsRequired = opts.Gateway.TLSConfig != nil
+		// We expect a CONNECT from the accepted connection.
+		c.setAuthTimer(secondsToDuration(opts.Gateway.AuthTimeout))
 	}
 
 	// Check for TLS
@@ -847,9 +855,6 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 		cs := c.nc.(*tls.Conn).ConnectionState()
 		c.Debugf("TLS version %s, cipher suite %s", tlsVersion(cs.Version), tlsCipher(cs.CipherSuite))
 	}
-
-	// Set the Ping timer after sending connect and info.
-	s.setFirstPingTimer(c)
 
 	c.mu.Unlock()
 
@@ -923,14 +928,11 @@ func (c *client) processGatewayConnect(arg []byte) error {
 		return ErrWrongGateway
 	}
 
-	// For a gateway connection, c.gw is guaranteed not to be nil here
-	// (created in createGateway() and never set to nil).
-	// For inbound connections, it is important to know in the parser
-	// if the CONNECT was received first, so we use this boolean (as
-	// opposed to client.flags that require locking) to indicate that
-	// CONNECT was processed. Again, this boolean is set/read in the
-	// readLoop without locking.
+	c.mu.Lock()
 	c.gw.connected = true
+	// Set the Ping timer after sending connect and info.
+	c.setFirstPingTimer()
+	c.mu.Unlock()
 
 	return nil
 }
@@ -1043,6 +1045,10 @@ func (c *client) processGatewayInfo(info *Info) {
 				c.Noticef("Outbound gateway connection to %q (%s) registered", gwName, info.ID)
 				// Now that the outbound gateway is registered, we can remove from temp map.
 				s.removeFromTempClients(cid)
+				// Set the Ping timer after sending connect and info.
+				c.mu.Lock()
+				c.setFirstPingTimer()
+				c.mu.Unlock()
 			} else {
 				// There was a bug that would cause a connection to possibly
 				// be called twice resulting in reconnection of twice the
@@ -1472,6 +1478,13 @@ func (g *gatewayCfg) updateURLs(infoURLs []string) {
 	}
 	// Then add the ones from the infoURLs array we got.
 	g.addURLs(infoURLs)
+	// The call above will set varzUpdateURLs only when finding ULRs in infoURLs
+	// that are not present in the config. That does not cover the case where
+	// previously "discovered" URLs are now gone. We could check "before" size
+	// of g.urls and if bigger than current size, set the boolean to true.
+	// Not worth it... simply set this to true to allow a refresh of gateway
+	// URLs in varz.
+	g.varzUpdateURLs = true
 	g.Unlock()
 }
 
@@ -2552,7 +2565,7 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 		sub.nm, sub.max = 0, 0
 		sub.client = gwc
 		sub.subject = subject
-		didDeliver = c.deliverMsg(sub, subject, mreply, mh, msg, false) || didDeliver
+		didDeliver = c.deliverMsg(sub, acc, subject, mreply, mh, msg, false) || didDeliver
 	}
 	// Done with subscription, put back to pool. We don't need
 	// to reset content since we explicitly set when using it.
@@ -2718,11 +2731,11 @@ func getSubjectFromGWRoutedReply(reply []byte, isOldPrefix bool) []byte {
 
 // This should be invoked only from processInboundGatewayMsg() or
 // processInboundRoutedMsg() and is checking if the subject
-// (c.pa.subject) has the $GNR prefix. If so, this is processed
+// (c.pa.subject) has the _GR_ prefix. If so, this is processed
 // as a GW reply and `true` is returned to indicate to the caller
 // that it should stop processing.
 // If gateway is not enabled on this server or if the subject
-// does not start with $GR, `false` is returned and caller should
+// does not start with _GR_, `false` is returned and caller should
 // process message as usual.
 func (c *client) handleGatewayReply(msg []byte) (processed bool) {
 	// Do not handle GW prefixed messages if this server does not have
@@ -2830,7 +2843,18 @@ func (c *client) handleGatewayReply(msg []byte) (processed bool) {
 			buf = append(buf, c.pa.reply...)
 			buf = append(buf, ' ')
 		}
-		buf = append(buf, c.pa.szb...)
+		szb := c.pa.szb
+		if c.pa.hdr >= 0 {
+			if route.headers {
+				buf[0] = 'H'
+				buf = append(buf, c.pa.hdb...)
+				buf = append(buf, ' ')
+			} else {
+				szb = []byte(strconv.Itoa(c.pa.size - c.pa.hdr))
+				msg = msg[c.pa.hdr:]
+			}
+		}
+		buf = append(buf, szb...)
 		mhEnd := len(buf)
 		buf = append(buf, _CRLF_...)
 		buf = append(buf, msg...)
@@ -3149,6 +3173,12 @@ func (s *Server) startGWReplyMapExpiration() {
 				}
 			case cttl := <-s.gwrm.ch:
 				ttl = cttl
+				if !t.Stop() {
+					select {
+					case <-t.C:
+					default:
+					}
+				}
 				t.Reset(ttl)
 			case <-s.quitCh:
 				return
